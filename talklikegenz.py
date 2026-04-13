@@ -4,6 +4,8 @@ from sklearn.feature_extraction.text import CountVectorizer
 from sklearn.naive_bayes import MultinomialNB
 import tkinter as tk
 from tkinter import ttk, messagebox
+import re
+import warnings
 
 CSV_PATH = "genz_dataset_final_augmented (1).csv"
 
@@ -141,6 +143,8 @@ def build_hash_table():
     return result
 
 slang_dict = build_hash_table()
+model = None
+vectorizer = None
 
 # ================= ALGORITHM EXPLANATIONS =================
 # HASH TABLE (Dictionary Lookup): O(1) Time Complexity
@@ -223,6 +227,141 @@ def kmp_search(text, pattern):
     
     return matches
 
+def normalize_text(text):
+    """
+    Normalize user input for reliable exact and substring matching.
+    """
+    text = str(text).lower().strip()
+    text = re.sub(r"[^a-z0-9\s]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+def add_unknown_slang(word):
+    """
+    Interactive flow to add unknown slang to CSV, then refresh model and hash table.
+    """
+    is_slang = messagebox.askyesno("Unknown Slang", f"'{word}' is unknown. Is this a slang?")
+    if not is_slang:
+        return f"⏭️ '{word}' skipped."
+
+    meaning = simple_input(f"Enter meaning of '{word}':")
+    if not meaning or not meaning.strip():
+        return f"⏭️ '{word}' skipped."
+
+    example = simple_input(f"Enter example sentence for '{word}' (or leave blank):")
+    if not example:
+        example = "N/A"
+
+    new_row = {
+        SLANG_COL: word,
+        DEF_COL: meaning,
+        EX_COL: example,
+    }
+
+    df_temp = pd.read_csv(CSV_PATH)
+    df_temp = pd.concat([df_temp, pd.DataFrame([new_row])], ignore_index=True)
+    df_temp.to_csv(CSV_PATH, index=False)
+
+    retrain_model()
+    return f"✅ '{word}' added to dictionary!"
+
+def find_kmp_candidates(query, max_results=5):
+    """
+    Use KMP to find close dictionary terms when exact lookup fails.
+
+    Matching strategy:
+    - query is substring of term (term contains query)
+    - term is substring of query (query contains term)
+    """
+    q = normalize_text(query)
+    if not q:
+        return []
+
+    scored = []
+    for term in slang_dict.keys():
+        contains_query = len(kmp_search(term, q)) > 0
+        query_contains_term = len(kmp_search(q, term)) > 0
+        if contains_query or query_contains_term:
+            # Smaller length gap usually means closer match.
+            length_gap = abs(len(term) - len(q))
+            scored.append((length_gap, term))
+
+    scored.sort(key=lambda x: (x[0], x[1]))
+    return [term for _, term in scored[:max_results]]
+
+def predict_with_naive_bayes(query, confidence_threshold=0.35):
+    """
+    Fallback prediction for unresolved queries using Multinomial Naive Bayes.
+    Returns (label, confidence) when confidence passes threshold, else None.
+    """
+    if model is None or vectorizer is None:
+        return None
+
+    q = normalize_text(query)
+    if not q:
+        return None
+
+    try:
+        q_vec = vectorizer.transform([q])
+        pred_label = model.predict(q_vec)[0]
+        proba = model.predict_proba(q_vec)[0]
+        confidence = float(proba.max())
+        if confidence >= confidence_threshold:
+            return pred_label, confidence
+    except Exception:
+        return None
+
+    return None
+
+def translate_query(user_text):
+    """
+    Query pipeline aligned with project goals:
+    1) Exact hash-table lookup (O(1) average)
+    2) Phrase scan via hash lookups
+    3) KMP candidate suggestions (O(n + m) per comparison)
+    4) Naive Bayes probabilistic fallback for unresolved queries
+    """
+    raw = user_text.strip()
+    normalized = normalize_text(raw)
+    if not normalized:
+        return "Please enter a slang word or sentence."
+
+    # Stage 1: direct dictionary lookup for single terms.
+    if " " not in normalized and normalized in slang_dict:
+        meaning, example = slang_dict[normalized]
+        if isinstance(example, str):
+            example = example.strip().strip('"').strip("'")
+        return f"{raw} → {meaning}\n📝 Example: {example}"
+
+    # Stage 2: sentence/phrase matching using O(1) hash lookups.
+    phrase_result = translate_sentence(raw)
+    if phrase_result != "❌ No slang found in the sentence.":
+        return phrase_result
+
+    # Stage 3: KMP-based candidate suggestions.
+    kmp_candidates = find_kmp_candidates(normalized, max_results=5)
+    if kmp_candidates:
+        lines = ["🔎 No exact match, but here are close slang terms (KMP):"]
+        for term in kmp_candidates:
+            meaning, _ = slang_dict[term]
+            lines.append(f"• {term} → {meaning}")
+        return "\n".join(lines)
+
+    # Stage 4: probabilistic ML fallback.
+    nb_guess = predict_with_naive_bayes(normalized)
+    if nb_guess:
+        pred_label, confidence = nb_guess
+        return (
+            "🤖 No exact dictionary match found.\n"
+            f"Naive Bayes fallback guess: {pred_label}\n"
+            f"Confidence: {confidence:.1%}"
+        )
+
+    # Optional interactive extension only for unknown single-term input.
+    if " " not in normalized:
+        return add_unknown_slang(raw)
+
+    return "❌ No slang found, and no confident fallback suggestion was available."
+
 def retrain_model():
     """
     Retrain Naive Bayes classifier and rebuild hash table.
@@ -253,7 +392,16 @@ def retrain_model():
     vectorizer = CountVectorizer(analyzer='word', ngram_range=(1,2))
     X_vec = vectorizer.fit_transform(X)
     model = MultinomialNB()
-    model.fit(X_vec, y)
+    # This dataset maps many unique definitions to slang entries, which can
+    # trigger sklearn's high-class-cardinality warning. The model is still
+    # used only as a low-confidence fallback, so we silence that expected noise.
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="The number of unique classes is greater than 50% of the number of samples.*",
+            category=UserWarning,
+        )
+        model.fit(X_vec, y)
     
     # Rebuild hash table with new data
     slang_dict = build_hash_table()
@@ -281,33 +429,8 @@ def translate_word(word):
         if isinstance(example, str):
             example = example.strip().strip('"').strip("'")
         return f"{word} → {meaning}\n📝 Example: {example}"
-    else:
-        is_slang = messagebox.askyesno("Unknown Slang", f"'{word}' is unknown. Is this a slang?")
-        if is_slang:
-            meaning = simple_input(f"Enter meaning of '{word}':")
-            if not meaning or not meaning.strip():
-                return f"⏭️ '{word}' skipped."
-                
-            example = simple_input(f"Enter example sentence for '{word}' (or leave blank):")
-            if not example:
-                example = "N/A"
-            
-            # Create new row with simplified format
-            new_row = {
-                SLANG_COL: word,
-                DEF_COL: meaning,
-                EX_COL: example,
-            }
-            
-            # Add to dataframe and save
-            df_temp = pd.read_csv(CSV_PATH)
-            df_temp = pd.concat([df_temp, pd.DataFrame([new_row])], ignore_index=True)
-            df_temp.to_csv(CSV_PATH, index=False)
-            
-            retrain_model()
-            return f"✅ '{word}' added to dictionary!"
-        else:
-            return f"⏭️ '{word}' skipped."
+
+    return add_unknown_slang(word)
 
 def translate_sentence(sentence):
     """
@@ -639,7 +762,7 @@ def on_translate():
     if text:
         output_text.config(state='normal')
         output_text.delete(1.0, tk.END)
-        result = translate_sentence(text)
+        result = translate_query(text)
         print(f"Final result to display:\n{result}")  # Debug output
         output_text.insert(tk.END, result)
         output_text.config(state='disabled')
@@ -648,6 +771,9 @@ def on_translate():
 
 # Bind Enter key to translate
 entry.bind('<Return>', lambda e: on_translate())
+
+# Train ML model once at startup so fallback is available before first query.
+retrain_model()
 
 # Footer
 footer = tk.Label(root, text="Made with 💚 for Gen Z", 
