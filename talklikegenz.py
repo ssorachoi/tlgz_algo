@@ -39,47 +39,244 @@ except FileNotFoundError:
     df = pd.DataFrame(columns=[SLANG_COL, DEF_COL, EX_COL])
     df.to_csv(CSV_PATH, index=False)
 
-# Normalize columns for the augmented dataset schema
-column_map = {
-    "slang_term": SLANG_COL,
-    "meaning": DEF_COL,
-    "slang_sentence": EX_COL,
-}
-df = df.rename(columns={k: v for k, v in column_map.items() if k in df.columns})
-
+# Clean and validate data (no need for column mapping - dataset is already in correct format)
 df = df.drop_duplicates(subset=SLANG_COL, keep='first')
 df = df.dropna(subset=[SLANG_COL, DEF_COL])
 df[SLANG_COL] = df[SLANG_COL].astype(str).str.strip()
 df[DEF_COL] = df[DEF_COL].astype(str).str.strip()
+df[EX_COL] = df[EX_COL].astype(str).str.strip() if EX_COL in df.columns else ""
 df = df[(df[SLANG_COL] != "") & (df[DEF_COL] != "")]
 
-# ----------------- Train Naive Bayes -----------------
-X = df[SLANG_COL]
-y = df[DEF_COL]
+# ================= Manual Meaning Corrections =================
+# WHY Manual Corrections?
+# - Dataset contains placeholder/circular definitions (e.g., "ate" → "ate")
+# - These occur in duplicated or auto-generated entries
+# - Use context from highest-quality entries to infer real meanings
+# - Improves user experience significantly
+#
+# CORRECTION STRATEGY: Map placeholder definitions to meaningful ones
+MEANING_CORRECTIONS = {
+    'ate': 'did really well or performed excellently',
+    'bare minimum': 'the lowest level of effort required',
+    'caught in 4k': 'caught on camera with undeniable proof',
+    'hard launch': 'publicly announcing something officially',
+    'ick': 'an immediate feeling of disgust or discomfort',
+    'big yikes': 'a strong expression of disapproval',
+    'head empty': 'not thinking about anything important',
+}
 
-vectorizer = CountVectorizer(analyzer='word', ngram_range=(1,2))
-X_vec = vectorizer.fit_transform(X)
+def correct_meaning(term_key, meaning):
+    """
+    Apply corrections to placeholder or circular definitions.
+    
+    Args:
+        term_key (str): The lowercase slang term
+        meaning (str): The original meaning from dataset
+    
+    Returns:
+        str: Corrected meaning or original if no correction needed
+    """
+    # Check if meaning is a placeholder (equals the term or very short)
+    if meaning.lower() == term_key or len(meaning) < 3:
+        return MEANING_CORRECTIONS.get(term_key, meaning)
+    return meaning
 
-model = MultinomialNB()
-model.fit(X_vec, y)
+# ================= Create Hash Table for O(1) Lookups =================
+# WHY Hash Table Instead of Linear Search?
+# - Direct access: O(1) average case vs O(n) for linear search
+# - Scales efficiently with dictionary growth
+# - Perfect for repeated lookups in interactive applications
+def build_hash_table():
+    """
+    Build hash table for O(1) dictionary lookups by extracting best examples.
+    
+    Quality Filtering Strategy:
+    - For duplicate slang terms, prefer entries with:
+      (1) Longer, more descriptive examples (more informative)
+      (2) "real" or "viral" trend_status over "generated"
+      (3) Higher frequency_score for commonly used terms
+    
+    Time Complexity: O(n log n) with sorting for quality ranking
+    Space Complexity: O(n) for hash table storage
+    
+    Returns:
+        dict: Hash table with lowercase slang terms as keys,
+              (meaning, example) tuples as values
+    """
+    slang_dict = {}
+    
+    for _, row in df.iterrows():
+        key = str(row[SLANG_COL]).strip().lower()
+        meaning = str(row[DEF_COL]).strip()
+        example = str(row[EX_COL]).strip() if EX_COL in df.columns else "N/A"
+        
+        # Get quality scores for better example selection
+        trend_status = str(row['trend_status']).strip().lower() if 'trend_status' in df.columns else 'unknown'
+        freq_score = float(row['frequency_score']) if 'frequency_score' in df.columns and pd.notna(row['frequency_score']) else 0.0
+        
+        # Quality heuristic: length + trend + frequency
+        quality_score = len(example) + (10 if trend_status in ['real', 'viral'] else 0) + (freq_score / 10)
+        
+        if key not in slang_dict:
+            # First entry for this term
+            slang_dict[key] = {
+                'meaning': meaning,
+                'example': example,
+                'quality': quality_score
+            }
+        else:
+            # Replace if new entry has higher quality
+            if quality_score > slang_dict[key]['quality']:
+                slang_dict[key] = {
+                    'meaning': meaning,
+                    'example': example,
+                    'quality': quality_score
+                }
+    
+    # Flatten to (meaning, example) tuples and apply corrections
+    result = {}
+    for k, v in slang_dict.items():
+        meaning = correct_meaning(k, v['meaning'])
+        result[k] = (meaning, v['example'])
+    return result
 
-# ----------------- Functions -----------------
+slang_dict = build_hash_table()
+
+# ================= ALGORITHM EXPLANATIONS =================
+# HASH TABLE (Dictionary Lookup): O(1) Time Complexity
+# ===========================================================
+# WHY Hash Table?
+# - Constant-time O(1) average-case lookups vs O(n) linear search
+# - Essential for scalable dictionary applications with dynamic datasets
+# - Industry standard for word/key lookup in NLP tools
+# - Supports efficient updates when adding new slang terms
+#
+# IMPLEMENTATION: Python dict provides native hash table with O(1) lookup
+# - Key: lowercase slang term (normalized for case-insensitive matching)
+# - Value: tuple of (meaning, example_sentence)
+#
+# KNUTH-MORRIS-PRATT (KMP) Algorithm: O(n + m) Time Complexity
+# ===========================================================
+# WHY KMP for Advanced Substring Matching?
+# - Naive string matching: O(n*m) with redundant comparisons
+# - KMP algorithm: O(n + m) with failure function preprocessing
+# - Prevents character re-comparisons by using pattern structure
+# - Optimal for finding partial slang matches or pattern detection
+# - Better than naive approach for long text or multiple searches
+
+def build_kmp_failure_function(pattern):
+    """
+    Build KMP failure function (prefix table) for pattern matching.
+    Time: O(m) where m is pattern length
+    Space: O(m)
+    
+    Args:
+        pattern (str): The pattern to build failure function for
+    
+    Returns:
+        list: Failure function array for KMP algorithm
+    """
+    m = len(pattern)
+    failure = [0] * m
+    j = 0
+    
+    for i in range(1, m):
+        while j > 0 and pattern[i] != pattern[j]:
+            j = failure[j - 1]
+        if pattern[i] == pattern[j]:
+            j += 1
+        failure[i] = j
+    
+    return failure
+
+def kmp_search(text, pattern):
+    """
+    Knuth-Morris-Pratt string matching algorithm.
+    Time: O(n + m) where n = text length, m = pattern length
+    Space: O(m) for failure function
+    
+    Args:
+        text (str): The text to search in
+        pattern (str): The pattern to find
+    
+    Returns:
+        list: All starting indices where pattern is found in text
+    """
+    n = len(text)
+    m = len(pattern)
+    
+    if m == 0 or m > n:
+        return []
+    
+    failure = build_kmp_failure_function(pattern)
+    matches = []
+    j = 0
+    
+    for i in range(n):
+        while j > 0 and text[i] != pattern[j]:
+            j = failure[j - 1]
+        if text[i] == pattern[j]:
+            j += 1
+        if j == m:
+            matches.append(i - m + 1)
+            j = failure[j - 1]
+    
+    return matches
+
 def retrain_model():
-    global model, vectorizer, X_vec
+    """
+    Retrain Naive Bayes classifier and rebuild hash table.
+    Reloads CSV to ensure new entries are included.
+    
+    WHY Naive Bayes for Classification?
+    - Good baseline for multi-class text classification
+    - Fast training and prediction O(m) where m = vocabulary size
+    - Works well with small to medium-sized datasets
+    - Probabilistic framework suitable for slang categorization
+    """
+    global model, vectorizer, X_vec, slang_dict, df
+    
+    # Reload CSV to get newly added entries
+    df = pd.read_csv(CSV_PATH)
+    
+    # Ensure columns exist and clean data
+    if SLANG_COL in df.columns and DEF_COL in df.columns:
+        df = df.drop_duplicates(subset=SLANG_COL, keep='first')
+        df = df.dropna(subset=[SLANG_COL, DEF_COL])
+        df[SLANG_COL] = df[SLANG_COL].astype(str).str.strip()
+        df[DEF_COL] = df[DEF_COL].astype(str).str.strip()
+        df = df[(df[SLANG_COL] != "") & (df[DEF_COL] != "")]
+    
+    # Train Naive Bayes
     X = df[SLANG_COL]
     y = df[DEF_COL]
     vectorizer = CountVectorizer(analyzer='word', ngram_range=(1,2))
     X_vec = vectorizer.fit_transform(X)
     model = MultinomialNB()
     model.fit(X_vec, y)
+    
+    # Rebuild hash table with new data
+    slang_dict = build_hash_table()
 
 def translate_word(word):
-    w_clean = word.strip().lower()
-    matched = df[df[SLANG_COL].str.lower() == w_clean]
+    """
+    Translate a single slang word using O(1) hash table lookup.
     
-    if not matched.empty:
-        meaning = matched[DEF_COL].values[0]
-        example = matched[EX_COL].values[0] if EX_COL in df.columns else "N/A"
+    Algorithm: Direct hash table access
+    Time Complexity: O(1) average case for lookup
+    Space Complexity: O(1)
+    
+    Args:
+        word (str): The slang word to translate
+    
+    Returns:
+        str: Translation result with meaning and example
+    """
+    w_clean = word.strip().lower()
+    
+    # O(1) hash table lookup instead of O(n) dataframe filtering
+    if w_clean in slang_dict:
+        meaning, example = slang_dict[w_clean]
         # Clean up extra quotes from CSV
         if isinstance(example, str):
             example = example.strip().strip('"').strip("'")
@@ -88,42 +285,80 @@ def translate_word(word):
         is_slang = messagebox.askyesno("Unknown Slang", f"'{word}' is unknown. Is this a slang?")
         if is_slang:
             meaning = simple_input(f"Enter meaning of '{word}':")
+            if not meaning or not meaning.strip():
+                return f"⏭️ '{word}' skipped."
+                
             example = simple_input(f"Enter example sentence for '{word}' (or leave blank):")
             if not example:
                 example = "N/A"
-            df.loc[len(df)] = [word, meaning, example]
-            df.to_csv(CSV_PATH, index=False)
+            
+            # Create new row with simplified format
+            new_row = {
+                SLANG_COL: word,
+                DEF_COL: meaning,
+                EX_COL: example,
+            }
+            
+            # Add to dataframe and save
+            df_temp = pd.read_csv(CSV_PATH)
+            df_temp = pd.concat([df_temp, pd.DataFrame([new_row])], ignore_index=True)
+            df_temp.to_csv(CSV_PATH, index=False)
+            
             retrain_model()
             return f"✅ '{word}' added to dictionary!"
         else:
             return f"⏭️ '{word}' skipped."
 
 def translate_sentence(sentence):
+    """
+    Translate all slang words and multi-word phrases in a sentence.
+    
+    Algorithm: Greedy multi-word phrase matching with O(1) hash table lookups
+    - Prioritizes longer phrases (e.g., "down bad" before "down")
+    - Greedy approach: matches longest available phrase first
+    Time Complexity: O(k*m) where k = words, m = max phrase length
+    Space Complexity: O(k) for results storage
+    
+    WHY This Approach?
+    - Handles multi-word slang terms (e.g., "down bad", "so down bad af")
+    - Greedy prioritization prevents incorrect single-word matches
+    - Efficient without complex NLP pipeline
+    
+    Args:
+        sentence (str): The sentence containing slang to translate
+    
+    Returns:
+        str: Formatted translation results for all found slang terms
+    """
     words = sentence.split()
     results = []
+    i = 0
+    max_phrase_len = 5  # Max words in a phrase (optimization)
 
-    for word in words:
-        w_clean = word.strip().lower()
-        matched = df[df[SLANG_COL].str.lower() == w_clean]
-
-        if not matched.empty:
-            meaning = matched[DEF_COL].values[0]
-            example = "N/A"
+    while i < len(words):
+        found = False
+        
+        # Try to match longest phrases first (greedy approach)
+        for phrase_len in range(min(max_phrase_len, len(words) - i), 0, -1):
+            phrase = " ".join(words[i:i+phrase_len]).lower().strip()
             
-            # Debug: Print what we're getting
-            print(f"Word: {word}")
-            print(f"Columns available: {matched.columns.tolist()}")
-            
-            if EX_COL in matched.columns:
-                example_value = matched[EX_COL].values[0]
-                print(f"Raw example value: {repr(example_value)}")
-                print(f"Is NaN: {pd.isna(example_value)}")
+            # O(1) hash table lookup
+            if phrase in slang_dict:
+                meaning, example = slang_dict[phrase]
                 
-                if pd.notna(example_value):  # Check if not NaN
-                    example = str(example_value).strip().strip('"').strip("'")
-                    print(f"Cleaned example: {example}")
-            
-            results.append(f"💬 {word} → {meaning}\n   📝 Example: {example}\n")
+                if isinstance(example, str):
+                    example = example.strip().strip('"').strip("'")
+                
+                # Display original casing for the phrase
+                original_phrase = " ".join(words[i:i+phrase_len])
+                results.append(f"💬 {original_phrase} → {meaning}\n   📝 Example: {example}\n")
+                
+                i += phrase_len
+                found = True
+                break
+        
+        if not found:
+            i += 1  # Move to next word if no phrase found
 
     if results:
         return "\n".join(results)
@@ -298,18 +533,20 @@ def on_button_leave_new(event):
     button_canvas.config(cursor='')
 
 def add_slang_manually():
-    """Function to manually add slang to the CSV"""
+    """
+    Function to manually add slang to the CSV.
+    Uses O(1) hash table lookup to check for duplicates.
+    Works with simplified dataset format: Slang, Definition, Example Sentence
+    """
     global df
     
     slang_word = simple_input("Enter the slang word:")
     if not slang_word or not slang_word.strip():
         return
     
-    # Check if slang already exists
+    # O(1) hash table lookup instead of O(n) dataframe filtering
     w_clean = slang_word.strip().lower()
-    matched = df[df[SLANG_COL].str.lower() == w_clean]
-    
-    if not matched.empty:
+    if w_clean in slang_dict:
         messagebox.showinfo("Already Exists", f"'{slang_word}' is already in the dictionary!")
         return
     
@@ -322,8 +559,15 @@ def add_slang_manually():
     if not example or not example.strip():
         example = "N/A"
     
+    # Create new row with simplified format
+    new_row = {
+        SLANG_COL: slang_word,
+        DEF_COL: meaning,
+        EX_COL: example,
+    }
+    
     # Add to dataframe
-    df.loc[len(df)] = [slang_word, meaning, example]
+    df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
     df.to_csv(CSV_PATH, index=False)
     retrain_model()
     
